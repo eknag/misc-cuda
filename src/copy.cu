@@ -5,34 +5,55 @@
 #include <numeric>
 
 template <int ITEMS_PER_THREAD, int THREADS>
-__global__ void copy_and_measure(const int *A, int *B, int n,
-                                 unsigned long long *times) {
-  constexpr int N = THREADS * ITEMS_PER_THREAD;
-  assert(n == N);
+__global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
+                                 int n, unsigned long long *times) {
+  constexpr int total_items = THREADS * ITEMS_PER_THREAD;
+  // Ensure n equals the expected total.
+  assert(n == total_items);
+  int tid = threadIdx.x;
 
-  // Compute global thread ID
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= THREADS) {
-    return;
-  }
+  // Allocate shared memory for the copy.
+  __shared__ int smem[total_items];
 
   // Record start clock
   unsigned long long start = clock64();
 
-  // Perform the copy in a grid-stride loop
-  for (int i = tid; i < N; i += 32) {
-    B[i] = A[i];
+  int base = tid * ITEMS_PER_THREAD;
+
+  // Using cp.async requires operating on 16 bytes (4 ints) at a time.
+  constexpr int vec_items =
+      ITEMS_PER_THREAD / 4; // assuming ITEMS_PER_THREAD is divisible by 4
+
+  const int4 *src = reinterpret_cast<const int4 *>(A + base);
+  int4 *smem_ptr = reinterpret_cast<int4 *>(&smem[base]);
+
+#pragma unroll
+  for (int i = 0; i < vec_items; ++i) {
+    // Asynchronously copy 16 bytes from global memory to shared memory.
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n"
+                 :
+                 : "l"(smem_ptr + i), "l"(src + i), "n"(16));
+  }
+  // Wait until all asynchronous copies of the current group have completed.
+  asm volatile("cp.async.wait_group 0;\n");
+
+  __syncthreads();
+
+  // Now move the data from shared memory (smem) to global B.
+  int4 *dst = reinterpret_cast<int4 *>(B + base);
+  int4 *s_ptr = reinterpret_cast<int4 *>(&smem[base]);
+#pragma unroll
+  for (int i = 0; i < vec_items; ++i) {
+    dst[i] = s_ptr[i];
   }
 
-  // Record end clock
+  // Record end clock including the global write.
   unsigned long long end = clock64();
-
-  // Store the cycle count in the device array
   times[tid] = end - start;
 }
 
 int main() {
-  constexpr int ITEMS_PER_THREAD = 10000;
+  constexpr int ITEMS_PER_THREAD = 100;
   constexpr int BLOCKS = 1;
   constexpr int THREADS = 32;
   constexpr int n = BLOCKS * THREADS * ITEMS_PER_THREAD;
@@ -85,8 +106,7 @@ int main() {
 
   // Print the per-thread cycle counts
   for (int i = 0; i < BLOCKS * THREADS; i++) {
-    printf("Thread %d took %llu cycles per element\n", i,
-           times_host[i] / ITEMS_PER_THREAD);
+    printf("Thread %d took %llu cycles per element\n", i, times_host[i]);
   }
 
   printf("Time taken: %f ms\n", milliseconds);
