@@ -1,0 +1,27 @@
+[pyproject.toml]
+[tool.black]
+line-length = 88
+target-version = ['py37', 'py38', 'py39', 'py310']
+include = '\.pyi?$'
+exclude = '''
+/(
+    .git
+    __pycache__
+    build
+    dist
+)/
+'''
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ['E203', 'W503']
+exclude = '.git,__pycache__,build,dist'
+
+[metadata]
+name = "pre-commit-hooks"
+version = "0.1.0"
+description = "Pre-commit hooks for formatting and linting Python, C++, and CUDA code."
+authors = [
+    { name = "Everett Knag", email = "everettknag@gmail.com" }
+]
+license = "MIT"
