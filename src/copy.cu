@@ -47,15 +47,13 @@ __global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
     reinterpret_cast<int4 *>(smem)[tid + i * THREADS] = vec;
   }
 
-  __syncthreads(); // Ensure all threads have finished writing to shared memory
-
-  // Vectorized store from shared memory to global memory
 #pragma unroll
   for (int i = 0; i < vectors_per_thread; ++i) {
     int4 vec = reinterpret_cast<int4 *>(smem)[tid + i * THREADS];
     reinterpret_cast<int4 *>(B)[tid + i * THREADS] = vec;
   }
 
+  __threadfence(); // Ensure all threads have finished writing to global memory
   unsigned long long end = clock64();
   times[tid] = end - start;
 }
@@ -116,10 +114,13 @@ int main() {
                        cudaMemcpyDeviceToHost));
 
   // Print the per-thread cycle counts
+  unsigned long long max_cycles = 0;
+
   for (int i = 0; i < BLOCKS * THREADS; i++) {
-    printf("Thread %d took %.1f cycles per element\n", i,
-           static_cast<float>(times_host[i]) / n);
+    max_cycles = std::max(max_cycles, times_host[i]);
   }
+
+  printf("%.1f cycles per element\n", static_cast<float>(max_cycles) / n);
 
   printf("Time taken: %f ms\n", milliseconds);
 
