@@ -26,7 +26,13 @@ __global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
                                  int n, unsigned long long *times) {
 
   constexpr int total_items = ITEMS_PER_WARP;
-  assert(n == total_items);
+  constexpr int items_per_thread = total_items / THREADS;
+  constexpr int vector_size =
+      4; // Using int4, which processes 4 integers at a time
+  constexpr int vectors_per_thread = items_per_thread / vector_size;
+
+  static_assert(total_items % (THREADS * vector_size) == 0,
+                "ITEMS_PER_WARP must be divisible by THREADS * vector_size");
 
   int tid = threadIdx.x;
 
@@ -34,13 +40,20 @@ __global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
 
   unsigned long long start = clock64();
 
+  // Vectorized load from global memory to shared memory
 #pragma unroll
-  for (int i = 0; i < total_items; i += THREADS) {
-    __pipeline_memcpy_async(&smem[i + tid], &A[i + tid], sizeof(int));
+  for (int i = 0; i < vectors_per_thread; ++i) {
+    int4 vec = reinterpret_cast<const int4 *>(A)[tid + i * THREADS];
+    reinterpret_cast<int4 *>(smem)[tid + i * THREADS] = vec;
   }
 
-  for (int i = 0; i < total_items; i += THREADS) {
-    B[i + tid] = smem[i + tid];
+  __syncthreads(); // Ensure all threads have finished writing to shared memory
+
+  // Vectorized store from shared memory to global memory
+#pragma unroll
+  for (int i = 0; i < vectors_per_thread; ++i) {
+    int4 vec = reinterpret_cast<int4 *>(smem)[tid + i * THREADS];
+    reinterpret_cast<int4 *>(B)[tid + i * THREADS] = vec;
   }
 
   unsigned long long end = clock64();
@@ -102,10 +115,6 @@ int main() {
                        BLOCKS * THREADS * sizeof(unsigned long long),
                        cudaMemcpyDeviceToHost));
 
-  for (int i = 0; i < 10; i++) {
-    assert(A[i] == B[i]);
-  }
-
   // Print the per-thread cycle counts
   for (int i = 0; i < BLOCKS * THREADS; i++) {
     printf("Thread %d took %.1f cycles per element\n", i,
@@ -113,6 +122,10 @@ int main() {
   }
 
   printf("Time taken: %f ms\n", milliseconds);
+
+  for (int i = 0; i < n; i++) {
+    assert(A[i] == B[i]);
+  }
 
   // Cleanup
   delete[] times_host;
