@@ -21,45 +21,54 @@ inline void gpuAssert(cudaError_t code, const char *file, int line,
   }
 }
 
-template <int ITEMS_PER_WARP, int THREADS>
+template <int TILE_SIZE, int THREADS>
 __global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
                                  int n, unsigned long long *times) {
 
-  constexpr int total_items = ITEMS_PER_WARP;
-  constexpr int items_per_thread = total_items / THREADS;
+  constexpr int tile_items_per_thread = TILE_SIZE / THREADS;
   constexpr int vector_size =
       4; // Using int4, which processes 4 integers at a time
-  constexpr int vectors_per_thread = items_per_thread / vector_size;
+  constexpr int tile_vectors_per_thread = tile_items_per_thread / vector_size;
+  constexpr int tile_vectors = TILE_SIZE / vector_size;
 
-  static_assert(total_items % (THREADS * vector_size) == 0,
+  static_assert(tile_items_per_thread % (THREADS * vector_size) == 0,
                 "ITEMS_PER_WARP must be divisible by THREADS * vector_size");
+
+  assert(n % TILE_SIZE == 0);
 
   int tid = threadIdx.x;
 
-  __shared__ __align__(16) int smem[total_items];
+  __shared__ __align__(16) int smem[TILE_SIZE];
+
+  const int iters = n / TILE_SIZE;
 
   unsigned long long start = clock64();
 
-  // Vectorized load from global memory to shared memory
+  for (int iter = 0; iter < iters; ++iter) {
+
+    // Vectorized load from global memory to shared memory
 #pragma unroll
-  for (int i = 0; i < vectors_per_thread; ++i) {
-    int4 vec = reinterpret_cast<const int4 *>(A)[tid + i * THREADS];
-    reinterpret_cast<int4 *>(smem)[tid + i * THREADS] = vec;
-  }
+    for (int i = 0; i < tile_vectors_per_thread; ++i) {
+      const int4 vec = reinterpret_cast<const int4 *>(
+          A)[tid + i * THREADS + iter * tile_vectors];
+      reinterpret_cast<int4 *>(smem)[tid + i * THREADS] = vec;
+    }
 
 #pragma unroll
-  for (int i = 0; i < vectors_per_thread; ++i) {
-    int4 vec = reinterpret_cast<int4 *>(smem)[tid + i * THREADS];
-    reinterpret_cast<int4 *>(B)[tid + i * THREADS] = vec;
+    for (int i = 0; i < tile_vectors_per_thread; ++i) {
+      const int4 vec = reinterpret_cast<int4 *>(smem)[tid + i * THREADS];
+      reinterpret_cast<int4 *>(B)[tid + i * THREADS + iter * tile_vectors] =
+          vec;
+    }
   }
-
   __threadfence(); // Ensure all threads have finished writing to global memory
   unsigned long long end = clock64();
   times[tid] = end - start;
 }
 
 int main() {
-  constexpr int ITEMS_PER_WARP = 8192;
+  constexpr int TILE_SIZE = 8192;
+  constexpr int ITEMS_PER_WARP = TILE_SIZE * 1024;
   constexpr int BLOCKS = 1;
   constexpr int THREADS = 32;
   constexpr int n = BLOCKS * ITEMS_PER_WARP;
@@ -93,7 +102,7 @@ int main() {
   cudaEventRecord(start);
 
   // Launch kernel
-  copy_and_measure<ITEMS_PER_WARP, THREADS>
+  copy_and_measure<TILE_SIZE, THREADS>
       <<<BLOCKS, THREADS>>>(A_dev, B_dev, n, times_dev);
 
   cudaEventRecord(stop);
