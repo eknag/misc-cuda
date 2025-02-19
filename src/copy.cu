@@ -1,5 +1,8 @@
 #include <assert.h>
+#include <cstdint>
 #include <cstdio>
+#include <cuda/pipeline>
+#include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 #include <malloc.h>
 #include <numeric>
@@ -21,47 +24,22 @@ inline void gpuAssert(cudaError_t code, const char *file, int line,
 template <int ITEMS_PER_WARP, int THREADS>
 __global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
                                  int n, unsigned long long *times) {
+
   constexpr int total_items = ITEMS_PER_WARP;
-  // Ensure n equals the expected total.
   assert(n == total_items);
 
   int tid = threadIdx.x;
-  int wid = threadIdx.x / 32;
 
-  // Allocate shared memory for the copy, aligned to 16 bytes.
   __shared__ __align__(16) int smem[total_items];
 
   unsigned long long start = clock64();
 
-  int base = wid * total_items;
-
-  // Using cp.async requires operating on 16 bytes (4 ints) at a time.
-  constexpr int vec_items = total_items / 4; // must be divisible by 4
-
-  const int4 *src = reinterpret_cast<const int4 *>(A + base);
-  int4 *smem_ptr = reinterpret_cast<int4 *>(&smem[base]);
-
-#pragma unroll
-  for (int i = 0; i < vec_items; ++i) {
-    // Copy 16 bytes from global memory to shared memory asynchronously
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n"
-                 :
-                 : "r"(i * 16), "l"(src + i), "n"(16));
+  for (int i = 0; i < total_items; i += THREADS) {
+    __pipeline_memcpy_async(&smem[i + tid], &A[i + tid], sizeof(int));
   }
 
-  // Commit the group of asynchronous copies
-  asm volatile("cp.async.commit_group;\n");
-  // Wait until the committed group (1 group) finishes
-  asm volatile("cp.async.wait_group 1;\n");
-
-  __syncthreads(); // ensure data is ready
-
-  // Now move the data from shared memory (smem) to global B.
-  int4 *dst = reinterpret_cast<int4 *>(B + base);
-  int4 *s_ptr = reinterpret_cast<int4 *>(&smem[base]);
-#pragma unroll
-  for (int i = 0; i < vec_items; ++i) {
-    dst[i] = s_ptr[i];
+  for (int i = 0; i < total_items; i += THREADS) {
+    B[i + tid] = smem[i + tid];
   }
 
   unsigned long long end = clock64();
@@ -129,7 +107,8 @@ int main() {
 
   // Print the per-thread cycle counts
   for (int i = 0; i < BLOCKS * THREADS; i++) {
-    printf("Thread %d took %llu cycles per element\n", i, times_host[i] / n);
+    printf("Thread %d took %.1f cycles per element\n", i,
+           static_cast<float>(times_host[i]) / n);
   }
 
   printf("Time taken: %f ms\n", milliseconds);
