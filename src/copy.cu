@@ -34,6 +34,7 @@ __global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
 
   unsigned long long start = clock64();
 
+#pragma unroll
   for (int i = 0; i < total_items; i += THREADS) {
     __pipeline_memcpy_async(&smem[i + tid], &A[i + tid], sizeof(int));
   }
