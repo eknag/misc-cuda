@@ -1,127 +1,84 @@
-#include <assert.h>
 #include <cstdint>
 #include <cstdio>
 #include <cuda/pipeline>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
-#include <malloc.h>
+#include <memory>
 #include <numeric>
 
-#define gpuErrchk(ans)                                                         \
-  {                                                                            \
-    gpuAssert((ans), __FILE__, __LINE__);                                      \
-  }
-inline void gpuAssert(cudaError_t code, const char *file, int line,
-                      bool abort = true) {
-  if (code != cudaSuccess) {
-    fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file,
-            line);
-    if (abort)
-      exit(code);
-  }
-}
+#include "util.cu"
 
-template <int TILE_SIZE, int THREADS, typename VEC_T>
-__global__ void copy(const int *__restrict__ A, int *__restrict__ B, int n) {
+__global__ void copy(const int *__restrict__ src, int *__restrict__ dst,
+                     int size) {
+  constexpr int UNROLL = 32;
+  constexpr int VEC_SIZE = sizeof(int4) / sizeof(int);
 
-  constexpr int vector_elements = sizeof(VEC_T) / sizeof(int);
-  constexpr int tile_vectors = TILE_SIZE / vector_elements;
-  VEC_T vecs[TILE_SIZE / vector_elements];
+  int4 buffer[UNROLL];
 
-  const int tid = threadIdx.x;
-  const int bid = blockIdx.x;
-  const int total_blocks = gridDim.x;
-  const int items_per_block = n / total_blocks;
-  const int block_start = bid * items_per_block;
-  const int block_end =
-      (bid == total_blocks - 1) ? n : block_start + items_per_block;
-  const int iters = (block_end - block_start) / TILE_SIZE;
+  const int num_threads = blockDim.x * gridDim.x;
+  const int stride = num_threads * UNROLL;
 
-  for (int iter = 0; iter < iters; ++iter) {
-    const int offset = tid + (block_start + iter * TILE_SIZE) / vector_elements;
+  const int4 *__restrict__ src_vec = reinterpret_cast<const int4 *>(src);
+  int4 *__restrict__ dst_vec = reinterpret_cast<int4 *>(dst);
+  size = size / VEC_SIZE;
 
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += stride) {
 #pragma unroll
-    for (int i = 0; i < tile_vectors; i += THREADS) {
-      vecs[i] = reinterpret_cast<const VEC_T *>(A)[offset + i];
+    for (int i = 0; i < UNROLL; i++) {
+      buffer[i] = src_vec[idx + i * num_threads];
     }
 
 #pragma unroll
-    for (int i = 0; i < tile_vectors; i += THREADS) {
-      reinterpret_cast<VEC_T *>(B)[offset + i] = vecs[i];
+    for (int i = 0; i < UNROLL; i++) {
+      dst_vec[idx + i * num_threads] = buffer[i];
     }
   }
 }
 
 int main() {
-  constexpr int TILE_SIZE = 16384;
   constexpr int THREADS = 256;
-  constexpr int BLOCKS = 108; // Increased number of blocks
-  constexpr int n = 16384 * 1024 * 108;
+  constexpr int BLOCKS = 108;
+  constexpr int N = 16384 * 1024 * 108;
+  constexpr float BASELINE_ELEM_PER_CYCLE = 117.0f;
+  constexpr float A100_SM_FREQ = 1.41e9f;
 
-  int *A = static_cast<int *>(malloc(sizeof(int) * n));
-  int *B = static_cast<int *>(malloc(sizeof(int) * n));
+  auto host_src = std::make_unique<int[]>(N);
+  auto host_dst = std::make_unique<int[]>(N);
+  std::iota(host_src.get(), host_src.get() + N, 0);
 
-  // Initialize A with consecutive values starting from 0
-  std::iota(A, A + n, 0);
+  auto dev_src = make_cuda_unique<int>(N);
+  auto dev_dst = make_cuda_unique<int>(N);
 
-  // Device pointers
-  int *A_dev = nullptr;
-  int *B_dev = nullptr;
-
-  // Allocate device memory
-  gpuErrchk(cudaMalloc(&A_dev, n * sizeof(int)));
-  gpuErrchk(cudaMalloc(&B_dev, n * sizeof(int)));
-
-  // Copy data from host to device
-  gpuErrchk(cudaMemcpy(A_dev, A, n * sizeof(int), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(dev_src.get(), host_src.get(), N * sizeof(int),
+                        cudaMemcpyHostToDevice));
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-
   cudaEventRecord(start);
 
-  // Launch kernel
-  copy<TILE_SIZE, THREADS, int4><<<BLOCKS, THREADS>>>(A_dev, B_dev, n);
+  copy<<<BLOCKS, THREADS>>>(dev_src.get(), dev_dst.get(), N);
 
   cudaEventRecord(stop);
-
   cudaEventSynchronize(stop);
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
 
-  gpuErrchk(cudaPeekAtLastError());
+  CHECK_CUDA(cudaPeekAtLastError());
+  CHECK_CUDA(cudaMemcpy(host_dst.get(), dev_dst.get(), N * sizeof(int),
+                        cudaMemcpyDeviceToHost));
 
-  // Copy back results
-  gpuErrchk(cudaMemcpy(B, B_dev, n * sizeof(int), cudaMemcpyDeviceToHost));
+  const int cycles_taken = milliseconds * A100_SM_FREQ / 1e3;
+  printf("%.0f elem/clk, Baseline cudaMemcpy %.0f elem/clk\n",
+         static_cast<float>(N) / static_cast<float>(cycles_taken),
+         BASELINE_ELEM_PER_CYCLE);
 
-  constexpr float A100_HBM_BW = 1.55e12;
-  constexpr float A100_SM_FREQ = 1.41e9;
-  constexpr float A100_SM_CYCLES_PER_MS = A100_SM_FREQ / 1e3;
-  constexpr float bytes_per_cycle = A100_HBM_BW / A100_SM_FREQ;
-  constexpr float elements_per_cycle = bytes_per_cycle / (2 * sizeof(int));
-
-  const int cycles_taken = milliseconds * A100_SM_CYCLES_PER_MS;
-
-  printf("%.3f elements per cycle, hardware roofline %.3f\n",
-         static_cast<float>(n) / static_cast<float>(cycles_taken),
-         elements_per_cycle);
-
-  printf("Time taken: %0.3f ms\n", milliseconds);
-
-  for (int i = 0; i < n; i++) {
-    if (A[i] != B[i]) {
-      printf("Mismatch at index %d: %d != %d\n", i, A[i], B[i]);
-    }
-    assert(A[i] == B[i]);
+  if (memcmp(host_src.get(), host_dst.get(), N * sizeof(int)) != 0) {
+    fprintf(stderr, "Arrays do not match\n");
+    abort();
   }
 
-  // Cleanup
-
-  cudaFree(A_dev);
-  cudaFree(B_dev);
-  free(A);
-  free(B);
-
   return 0;
+  // No need for manual cudaFree or free - smart pointers handle cleanup
 }

@@ -16,7 +16,7 @@ GPU_ARCH := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | h
 NVCC_ARCH_FLAG := -arch=sm_$(subst .,,$(GPU_ARCH))
 
 # nvcc flags
-NVCC_FLAGS = -O3  $(NVCC_ARCH_FLAG)
+NVCC_FLAGS = -O2  $(NVCC_ARCH_FLAG)
 
 # Default target
 all: $(TARGET)
