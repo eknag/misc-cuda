@@ -1,6 +1,6 @@
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <cstdio>
+#include <cuda_runtime.h>
 
 #define CHECK_CUDA(ans)                                                        \
   {                                                                            \
@@ -18,7 +18,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line,
 }
 
 struct CudaDeleter {
-  void operator()(void *ptr) const { cudaFree(ptr); }
+  void operator()(void *ptr) const { CHECK_CUDA(cudaFree(ptr)); }
 };
 
 template <typename T>
