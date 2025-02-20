@@ -22,48 +22,45 @@ inline void gpuAssert(cudaError_t code, const char *file, int line,
 }
 
 template <int TILE_SIZE, int THREADS, typename VEC_T>
-__global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
-                                 int n, unsigned long long *start_cycle,
-                                 unsigned long long *end_cycle) {
+__global__ void copy(const int *__restrict__ A, int *__restrict__ B, int n) {
 
   constexpr int vector_elements = sizeof(VEC_T) / sizeof(int);
   constexpr int tile_vectors = TILE_SIZE / vector_elements;
   __shared__ __align__(16) VEC_T smem[tile_vectors];
 
   const int tid = threadIdx.x;
-  const int iters = n / TILE_SIZE;
-
-  start_cycle[tid] = clock64();
+  const int bid = blockIdx.x;
+  const int total_blocks = gridDim.x;
+  const int items_per_block = n / total_blocks;
+  const int block_start = bid * items_per_block;
+  const int block_end =
+      (bid == total_blocks - 1) ? n : block_start + items_per_block;
+  const int iters = (block_end - block_start) / TILE_SIZE;
 
   for (int iter = 0; iter < iters; ++iter) {
+    const int offset = (block_start + iter * TILE_SIZE) / vector_elements;
 
 #pragma unroll
     for (int i = 0; i < tile_vectors; i += THREADS) {
       __pipeline_memcpy_async(
-          &smem[i + tid],
-          &reinterpret_cast<const VEC_T *>(A)[i + tid + iter * tile_vectors],
+          &smem[i + tid], &reinterpret_cast<const VEC_T *>(A)[offset + i + tid],
           sizeof(VEC_T));
     }
     __pipeline_commit();
     __pipeline_wait_prior(0);
+
 #pragma unroll
     for (int i = 0; i < tile_vectors; i += THREADS) {
-      reinterpret_cast<VEC_T *>(B)[i + tid + iter * tile_vectors] =
-          smem[i + tid];
+      reinterpret_cast<VEC_T *>(B)[offset + i + tid] = smem[i + tid];
     }
   }
-  __threadfence(); // Ensure all threads have finished writing to global
-                   // memory
-
-  end_cycle[tid] = clock64();
 }
 
 int main() {
   constexpr int TILE_SIZE = 8192;
-  constexpr int ITEMS_PER_WARP = TILE_SIZE * 1024;
-  constexpr int BLOCKS = 1;
   constexpr int THREADS = 256;
-  constexpr int n = BLOCKS * ITEMS_PER_WARP;
+  constexpr int BLOCKS = 108; // Increased number of blocks
+  constexpr int n = TILE_SIZE * 1024 * 108;
 
   int *A = static_cast<int *>(malloc(sizeof(int) * n));
   int *B = static_cast<int *>(malloc(sizeof(int) * n));
@@ -82,15 +79,6 @@ int main() {
   // Copy data from host to device
   gpuErrchk(cudaMemcpy(A_dev, A, n * sizeof(int), cudaMemcpyHostToDevice));
 
-  // Create a device array to store the cycle count for each thread
-  unsigned long long *start_cycle_dev = nullptr;
-  unsigned long long *end_cycle_dev = nullptr;
-
-  gpuErrchk(cudaMalloc(&start_cycle_dev,
-                       BLOCKS * THREADS * sizeof(unsigned long long)));
-  gpuErrchk(cudaMalloc(&end_cycle_dev,
-                       BLOCKS * THREADS * sizeof(unsigned long long)));
-
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
@@ -98,8 +86,7 @@ int main() {
   cudaEventRecord(start);
 
   // Launch kernel
-  copy_and_measure<TILE_SIZE, THREADS, int4>
-      <<<BLOCKS, THREADS>>>(A_dev, B_dev, n, start_cycle_dev, end_cycle_dev);
+  copy<TILE_SIZE, THREADS, int4><<<BLOCKS, THREADS>>>(A_dev, B_dev, n);
 
   cudaEventRecord(stop);
 
@@ -112,30 +99,16 @@ int main() {
   // Copy back results
   gpuErrchk(cudaMemcpy(B, B_dev, n * sizeof(int), cudaMemcpyDeviceToHost));
 
-  // Now copy the timing data from the device
-  unsigned long long *start_cycle_host =
-      new unsigned long long[BLOCKS * THREADS];
-  gpuErrchk(cudaMemcpy(start_cycle_host, start_cycle_dev,
-                       BLOCKS * THREADS * sizeof(unsigned long long),
-                       cudaMemcpyDeviceToHost));
+  constexpr float A100_HBM_BW = 1.6e12;
+  constexpr float A100_SM_FREQ = 1.41e9;
+  constexpr float A100_SM_CYCLES_PER_MS = A100_SM_FREQ / 1e3;
+  constexpr float bytes_per_cycle = A100_HBM_BW / A100_SM_FREQ;
+  constexpr float cycles_per_element = 2 * sizeof(int) / bytes_per_cycle;
 
-  unsigned long long *end_cycle_host = new unsigned long long[BLOCKS * THREADS];
-  gpuErrchk(cudaMemcpy(end_cycle_host, end_cycle_dev,
-                       BLOCKS * THREADS * sizeof(unsigned long long),
-                       cudaMemcpyDeviceToHost));
+  const int cycles_taken = milliseconds * A100_SM_CYCLES_PER_MS;
 
-  // Print the per-thread cycle counts
-  unsigned long long min_s = UINT64_MAX;
-  unsigned long long max_e = 0;
-
-  for (int i = 0; i < BLOCKS * THREADS; i++) {
-    min_s = std::min(min_s, start_cycle_host[i]);
-    max_e = std::max(max_e, end_cycle_host[i]);
-  }
-
-  unsigned long long max_cycles = max_e - min_s;
-
-  printf("%.3f cycles per element\n", static_cast<float>(max_cycles) / n);
+  printf("%.3f cycles per element, best cast %.3f\n",
+         static_cast<float>(cycles_taken) / n, cycles_per_element);
 
   printf("Time taken: %0.3f ms\n", milliseconds);
 
@@ -147,10 +120,7 @@ int main() {
   }
 
   // Cleanup
-  delete[] start_cycle_host;
-  delete[] end_cycle_host;
-  cudaFree(start_cycle_dev);
-  cudaFree(end_cycle_dev);
+
   cudaFree(A_dev);
   cudaFree(B_dev);
   free(A);
