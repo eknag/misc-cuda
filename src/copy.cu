@@ -26,7 +26,7 @@ __global__ void copy(const int *__restrict__ A, int *__restrict__ B, int n) {
 
   constexpr int vector_elements = sizeof(VEC_T) / sizeof(int);
   constexpr int tile_vectors = TILE_SIZE / vector_elements;
-  __shared__ __align__(16) VEC_T smem[tile_vectors];
+  VEC_T vecs[TILE_SIZE / vector_elements];
 
   const int tid = threadIdx.x;
   const int bid = blockIdx.x;
@@ -38,29 +38,25 @@ __global__ void copy(const int *__restrict__ A, int *__restrict__ B, int n) {
   const int iters = (block_end - block_start) / TILE_SIZE;
 
   for (int iter = 0; iter < iters; ++iter) {
-    const int offset = (block_start + iter * TILE_SIZE) / vector_elements;
+    const int offset = tid + (block_start + iter * TILE_SIZE) / vector_elements;
 
 #pragma unroll
     for (int i = 0; i < tile_vectors; i += THREADS) {
-      __pipeline_memcpy_async(
-          &smem[i + tid], &reinterpret_cast<const VEC_T *>(A)[offset + i + tid],
-          sizeof(VEC_T));
+      vecs[i] = reinterpret_cast<const VEC_T *>(A)[offset + i];
     }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
 
 #pragma unroll
     for (int i = 0; i < tile_vectors; i += THREADS) {
-      reinterpret_cast<VEC_T *>(B)[offset + i + tid] = smem[i + tid];
+      reinterpret_cast<VEC_T *>(B)[offset + i] = vecs[i];
     }
   }
 }
 
 int main() {
-  constexpr int TILE_SIZE = 8192;
+  constexpr int TILE_SIZE = 16384;
   constexpr int THREADS = 256;
   constexpr int BLOCKS = 108; // Increased number of blocks
-  constexpr int n = TILE_SIZE * 1024 * 108;
+  constexpr int n = 16384 * 1024 * 108;
 
   int *A = static_cast<int *>(malloc(sizeof(int) * n));
   int *B = static_cast<int *>(malloc(sizeof(int) * n));
@@ -99,16 +95,17 @@ int main() {
   // Copy back results
   gpuErrchk(cudaMemcpy(B, B_dev, n * sizeof(int), cudaMemcpyDeviceToHost));
 
-  constexpr float A100_HBM_BW = 1.6e12;
+  constexpr float A100_HBM_BW = 1.55e12;
   constexpr float A100_SM_FREQ = 1.41e9;
   constexpr float A100_SM_CYCLES_PER_MS = A100_SM_FREQ / 1e3;
   constexpr float bytes_per_cycle = A100_HBM_BW / A100_SM_FREQ;
-  constexpr float cycles_per_element = 2 * sizeof(int) / bytes_per_cycle;
+  constexpr float elements_per_cycle = bytes_per_cycle / (2 * sizeof(int));
 
   const int cycles_taken = milliseconds * A100_SM_CYCLES_PER_MS;
 
-  printf("%.3f cycles per element, best cast %.3f\n",
-         static_cast<float>(cycles_taken) / n, cycles_per_element);
+  printf("%.3f elements per cycle, hardware roofline %.3f\n",
+         static_cast<float>(n) / static_cast<float>(cycles_taken),
+         elements_per_cycle);
 
   printf("Time taken: %0.3f ms\n", milliseconds);
 
