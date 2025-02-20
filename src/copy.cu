@@ -1,146 +1,84 @@
-#include <assert.h>
+#include <cstdint>
 #include <cstdio>
+#include <cuda/pipeline>
+#include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
-#include <malloc.h>
+#include <memory>
 #include <numeric>
 
-#define gpuErrchk(ans)                                                         \
-  {                                                                            \
-    gpuAssert((ans), __FILE__, __LINE__);                                      \
-  }
-inline void gpuAssert(cudaError_t code, const char *file, int line,
-                      bool abort = true) {
-  if (code != cudaSuccess) {
-    fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file,
-            line);
-    if (abort)
-      exit(code);
-  }
-}
+#include "util.cu"
 
-template <int ITEMS_PER_WARP, int THREADS>
-__global__ void copy_and_measure(const int *__restrict__ A, int *__restrict__ B,
-                                 int n, unsigned long long *times) {
-  constexpr int total_items = ITEMS_PER_WARP;
-  // Ensure n equals the expected total.
-  assert(n == total_items);
+__global__ void copy(const int *__restrict__ src, int *__restrict__ dst,
+                     int size) {
+  constexpr int UNROLL = 32;
+  constexpr int VEC_SIZE = sizeof(int4) / sizeof(int);
 
-  int tid = threadIdx.x;
-  int wid = threadIdx.x / 32;
+  int4 buffer[UNROLL];
 
-  // Allocate shared memory for the copy, aligned to 16 bytes.
-  __shared__ __align__(16) int smem[total_items];
+  const int num_threads = blockDim.x * gridDim.x;
+  const int stride = num_threads * UNROLL;
 
-  unsigned long long start = clock64();
+  const int4 *__restrict__ src_vec = reinterpret_cast<const int4 *>(src);
+  int4 *__restrict__ dst_vec = reinterpret_cast<int4 *>(dst);
+  size = size / VEC_SIZE;
 
-  int base = wid * total_items;
-
-  // Using cp.async requires operating on 16 bytes (4 ints) at a time.
-  constexpr int vec_items = total_items / 4; // must be divisible by 4
-
-  const int4 *src = reinterpret_cast<const int4 *>(A + base);
-  int4 *smem_ptr = reinterpret_cast<int4 *>(&smem[base]);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += stride) {
+#pragma unroll
+    for (int i = 0; i < UNROLL; i++) {
+      buffer[i] = src_vec[idx + i * num_threads];
+    }
 
 #pragma unroll
-  for (int i = 0; i < vec_items; ++i) {
-    // Copy 16 bytes from global memory to shared memory asynchronously
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n"
-                 :
-                 : "r"(i * 16), "l"(src + i), "n"(16));
+    for (int i = 0; i < UNROLL; i++) {
+      dst_vec[idx + i * num_threads] = buffer[i];
+    }
   }
-
-  // Commit the group of asynchronous copies
-  asm volatile("cp.async.commit_group;\n");
-  // Wait until the committed group (1 group) finishes
-  asm volatile("cp.async.wait_group 1;\n");
-
-  __syncthreads(); // ensure data is ready
-
-  // Now move the data from shared memory (smem) to global B.
-  int4 *dst = reinterpret_cast<int4 *>(B + base);
-  int4 *s_ptr = reinterpret_cast<int4 *>(&smem[base]);
-#pragma unroll
-  for (int i = 0; i < vec_items; ++i) {
-    dst[i] = s_ptr[i];
-  }
-
-  unsigned long long end = clock64();
-  times[tid] = end - start;
 }
 
 int main() {
-  constexpr int ITEMS_PER_WARP = 8192;
-  constexpr int BLOCKS = 1;
-  constexpr int THREADS = 32;
-  constexpr int n = BLOCKS * ITEMS_PER_WARP;
+  constexpr int THREADS = 256;
+  constexpr int BLOCKS = 108;
+  constexpr int N = 16384 * 1024 * 108;
+  constexpr float BASELINE_ELEM_PER_CYCLE = 117.0f;
+  constexpr float A100_SM_FREQ = 1.41e9f;
 
-  int *A = static_cast<int *>(malloc(sizeof(int) * n));
-  int *B = static_cast<int *>(malloc(sizeof(int) * n));
+  auto host_src = std::make_unique<int[]>(N);
+  auto host_dst = std::make_unique<int[]>(N);
+  std::iota(host_src.get(), host_src.get() + N, 0);
 
-  // Initialize A with consecutive values starting from 0
-  std::iota(A, A + n, 0);
+  auto dev_src = make_cuda_unique<int>(N);
+  auto dev_dst = make_cuda_unique<int>(N);
 
-  // Device pointers
-  int *A_dev = nullptr;
-  int *B_dev = nullptr;
-
-  // Allocate device memory
-  gpuErrchk(cudaMalloc(&A_dev, n * sizeof(int)));
-  gpuErrchk(cudaMalloc(&B_dev, n * sizeof(int)));
-
-  // Copy data from host to device
-  gpuErrchk(cudaMemcpy(A_dev, A, n * sizeof(int), cudaMemcpyHostToDevice));
-
-  // Create a device array to store the cycle count for each thread
-  unsigned long long *times_dev = nullptr;
-  gpuErrchk(
-      cudaMalloc(&times_dev, BLOCKS * THREADS * sizeof(unsigned long long)));
+  CHECK_CUDA(cudaMemcpy(dev_src.get(), host_src.get(), N * sizeof(int),
+                        cudaMemcpyHostToDevice));
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-
   cudaEventRecord(start);
 
-  // Launch kernel
-  copy_and_measure<ITEMS_PER_WARP, THREADS>
-      <<<BLOCKS, THREADS>>>(A_dev, B_dev, n, times_dev);
+  copy<<<BLOCKS, THREADS>>>(dev_src.get(), dev_dst.get(), N);
 
   cudaEventRecord(stop);
-
   cudaEventSynchronize(stop);
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
 
-  gpuErrchk(cudaPeekAtLastError());
+  CHECK_CUDA(cudaPeekAtLastError());
+  CHECK_CUDA(cudaMemcpy(host_dst.get(), dev_dst.get(), N * sizeof(int),
+                        cudaMemcpyDeviceToHost));
 
-  // Copy back results
-  gpuErrchk(cudaMemcpy(B, B_dev, n * sizeof(int), cudaMemcpyDeviceToHost));
+  const int cycles_taken = milliseconds * A100_SM_FREQ / 1e3;
+  printf("%.0f elem/clk, Baseline cudaMemcpy %.0f elem/clk\n",
+         static_cast<float>(N) / static_cast<float>(cycles_taken),
+         BASELINE_ELEM_PER_CYCLE);
 
-  // Now copy the timing data from the device
-  unsigned long long *times_host = new unsigned long long[BLOCKS * THREADS];
-  gpuErrchk(cudaMemcpy(times_host, times_dev,
-                       BLOCKS * THREADS * sizeof(unsigned long long),
-                       cudaMemcpyDeviceToHost));
-
-  for (int i = 0; i < 10; i++) {
-    assert(A[i] == B[i]);
+  if (memcmp(host_src.get(), host_dst.get(), N * sizeof(int)) != 0) {
+    fprintf(stderr, "Arrays do not match\n");
+    abort();
   }
-
-  // Print the per-thread cycle counts
-  for (int i = 0; i < BLOCKS * THREADS; i++) {
-    printf("Thread %d took %llu cycles per element\n", i, times_host[i] / n);
-  }
-
-  printf("Time taken: %f ms\n", milliseconds);
-
-  // Cleanup
-  delete[] times_host;
-  cudaFree(times_dev);
-  cudaFree(A_dev);
-  cudaFree(B_dev);
-  free(A);
-  free(B);
 
   return 0;
+  // No need for manual cudaFree or free - smart pointers handle cleanup
 }
